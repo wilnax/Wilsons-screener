@@ -1,6 +1,15 @@
 {
-  "runDate": "2026-01-24T21:02:55.840649+00:00",
+  "runDate": "2026-01-24T21:17:19.169857+00:00",
   "treasuryYield10y": 0.0423,
   "dimension": "ART",
+  "stats": {
+    "totalTickersEvaluated": 0,
+    "asOfCalendardateMax": null,
+    "rule_div_pass": 0,
+    "rule_pe_pass": 0,
+    "rule_pb_pass": 0,
+    "rule_ltde_pass": 0,
+    "all_rules_pass": 0
+  },
   "pass": []
 }
