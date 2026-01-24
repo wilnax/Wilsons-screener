@@ -8,14 +8,11 @@ API_KEY = os.environ.get("NASDAQ_API_KEY")
 if not API_KEY:
     raise SystemExit("Missing NASDAQ_API_KEY")
 
-# Set in GitHub Actions Variables: TREASURY_10Y (example: 0.045 = 4.5%)
 TREASURY_10Y = float(os.environ.get("TREASURY_10Y", "0.045"))
-
 BASE = "https://data.nasdaq.com/api/v3/datatables"
 
 
 def _raise_with_context(resp: requests.Response) -> None:
-    """Print a helpful snippet before raising HTTP errors (shows up in Actions logs)."""
     if resp.ok:
         return
     snippet = (resp.text or "")[:800]
@@ -36,11 +33,6 @@ def download_csv(url: str, params: dict, timeout: int = 300) -> pd.DataFrame:
 
 
 def latest_trading_day_from_sep() -> str:
-    """
-    IMPORTANT FIX:
-    Do NOT use qopts.sort on this endpoint. It can return 422.
-    Instead, fetch a sample and take max(date) locally.
-    """
     url = f"{BASE}/SHARADAR/SEP.json"
     params = {
         "api_key": API_KEY,
@@ -48,7 +40,6 @@ def latest_trading_day_from_sep() -> str:
         "qopts.per_page": 1000,
     }
     j = get_json(url, params)
-
     cols = [c["name"] for c in j["datatable"]["columns"]]
     if "date" not in cols:
         raise SystemExit(f"SEP JSON did not include 'date'. Columns: {cols}")
@@ -58,36 +49,52 @@ def latest_trading_day_from_sep() -> str:
         d = dict(zip(cols, row)).get("date")
         if d:
             dates.append(d)
-
     if not dates:
-        raise SystemExit("Could not determine latest date from SEP sample (no dates returned).")
-
+        raise SystemExit("Could not determine latest date from SEP sample.")
     return max(dates)
+
+
+def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
 
 
 def load_sep_closes(latest_date: str) -> pd.DataFrame:
     """
-    Download close prices for all tickers on the latest trading day.
+    Download close prices for all tickers on a given date.
+    Make this robust to schema differences by auto-detecting columns.
     """
     url = f"{BASE}/SHARADAR/SEP.csv"
     params = {
         "api_key": API_KEY,
         "date": latest_date,
+        # Ask for the expected columns, but don't assume they'll come back exactly.
         "qopts.columns": "ticker,close",
         "qopts.export": "true",
     }
     df = download_csv(url, params)
-    df.columns = [c.lower() for c in df.columns]
-    df = df.dropna(subset=["ticker", "close"]).drop_duplicates(subset=["ticker"])
-    return df
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    ticker_col = _find_col(df, ["ticker", "symbol"])
+    close_col = _find_col(df, ["close", "adj_close", "closeadj", "close_adj", "closeadjusted", "adjclose"])
+
+    if ticker_col is None or close_col is None:
+        print("SEP.csv columns returned:", list(df.columns))
+        raise SystemExit(
+            "Could not find ticker/close columns in SEP.csv. "
+            "See printed columns above; we will map them."
+        )
+
+    out = df[[ticker_col, close_col]].copy()
+    out = out.rename(columns={ticker_col: "ticker", close_col: "close"})
+    out = out.dropna(subset=["ticker", "close"]).drop_duplicates(subset=["ticker"])
+    return out
 
 
 def load_sf1_latest() -> pd.DataFrame:
-    """
-    Download fundamentals for Wilson's Algorithm.
-    - ART: epsusd, dpsttm (TTM-ish)
-    - MRQ: bvps, debtlt, equity (balance sheet-ish)
-    """
     url = f"{BASE}/SHARADAR/SF1.csv"
     params = {
         "api_key": API_KEY,
@@ -96,14 +103,11 @@ def load_sf1_latest() -> pd.DataFrame:
         "qopts.export": "true",
     }
     df = download_csv(url, params)
-    df.columns = [c.lower() for c in df.columns]
+    df.columns = [c.strip().lower() for c in df.columns]
     return df
 
 
 def pick_latest_by_dimension(df: pd.DataFrame, dim: str) -> pd.DataFrame:
-    """
-    For each ticker, pick the latest row for the dimension by calendardate then lastupdated.
-    """
     sub = df[df["dimension"] == dim].copy()
     sub["calendardate"] = pd.to_datetime(sub["calendardate"], errors="coerce")
     sub["lastupdated"] = pd.to_datetime(sub["lastupdated"], errors="coerce")
@@ -112,13 +116,10 @@ def pick_latest_by_dimension(df: pd.DataFrame, dim: str) -> pd.DataFrame:
 
 
 def main() -> None:
-    # 1) Latest trading day and closes
     latest_date = latest_trading_day_from_sep()
     closes = load_sep_closes(latest_date)
 
-    # 2) Fundamentals snapshot
     sf1 = load_sf1_latest()
-
     required = {"ticker", "dimension", "calendardate", "epsusd", "bvps", "debtlt", "equity"}
     missing = required - set(sf1.columns)
     if missing:
@@ -130,24 +131,17 @@ def main() -> None:
     art = pick_latest_by_dimension(sf1, "ART")
     mrq = pick_latest_by_dimension(sf1, "MRQ")
 
-    # 3) Merge close + fundamentals
     df = closes.merge(art, on="ticker", how="inner")
     df = df.merge(mrq[["ticker", "bvps", "debtlt", "equity"]], on="ticker", how="left")
 
-    # 4) Compute metrics
     df["pe"] = df["close"] / df["epsusd"]
     df["pb"] = df["close"] / df["bvps"]
     df["debt_equity"] = df["debtlt"] / df["equity"]
-
-    if "dpsttm" in df.columns:
-        df["div_yield"] = df["dpsttm"] / df["close"]
-    else:
-        df["div_yield"] = pd.NA
+    df["div_yield"] = df["dpsttm"] / df["close"] if "dpsttm" in df.columns else pd.NA
 
     for col in ["close", "pe", "pb", "debt_equity", "div_yield"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # 5) Apply Wilson's Algorithm
     df["passes"] = (
         df["div_yield"].notna()
         & (df["div_yield"] >= TREASURY_10Y)
