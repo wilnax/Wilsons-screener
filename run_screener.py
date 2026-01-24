@@ -8,7 +8,7 @@ API_KEY = os.environ.get("NASDAQ_API_KEY")
 if not API_KEY:
     raise SystemExit("Missing NASDAQ_API_KEY")
 
-# GitHub Actions variable TREASURY_10Y (example: 0.045 = 4.5%)
+# Set in GitHub Actions Variables: TREASURY_10Y (example: 0.045 = 4.5%)
 TREASURY_10Y = float(os.environ.get("TREASURY_10Y", "0.045"))
 
 BASE = "https://data.nasdaq.com/api/v3/datatables"
@@ -75,9 +75,9 @@ def pick_latest_per_ticker(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
-    # Pull SF1 only — your schema already provides price/pe/pb/divyield.
-    # Use ART (annual trailing-style) as a single consistent dimension for ratios.
-    cols = "ticker,dimension,calendardate,lastupdated,price,pe,pb,divyield,de,debt,debtnc,equity"
+    # Pull SF1 only — your schema provides price/pe/pb/divyield directly.
+    # Use ART dimension for consistency with valuation ratios.
+    cols = "ticker,dimension,calendardate,lastupdated,price,pe,pb,divyield,debtnc,equity"
 
     sf1 = fetch_datatable_all_rows(
         "SHARADAR/SF1",
@@ -90,55 +90,38 @@ def main() -> None:
         max_pages=500,
     )
 
-    needed = {"ticker", "calendardate", "price", "pe", "pb", "divyield"}
-    missing = needed - set(sf1.columns)
+    required = {"ticker", "calendardate", "price", "pe", "pb", "divyield", "debtnc", "equity"}
+    missing = required - set(sf1.columns)
     if missing:
         raise SystemExit(f"SF1 missing required columns: {sorted(missing)}")
 
     latest = pick_latest_per_ticker(sf1)
 
-    # Numeric coercion
-    for col in ["price", "pe", "pb", "divyield", "de", "debt", "debtnc", "equity"]:
-        if col in latest.columns:
-            latest[col] = pd.to_numeric(latest[col], errors="coerce")
+    # Coerce to numeric
+    for col in ["price", "pe", "pb", "divyield", "debtnc", "equity"]:
+        latest[col] = pd.to_numeric(latest[col], errors="coerce")
 
-    # Long-term debt proxy:
-    # Prefer non-current debt (debtnc) / equity; else fall back to 'de' (debt/equity ratio),
-    # else debt / equity.
-    debt_equity = None
-    if "debtnc" in latest.columns and "equity" in latest.columns:
-        debt_equity = latest["debtnc"] / latest["equity"]
-    elif "de" in latest.columns:
-        debt_equity = latest["de"]
-    elif "debt" in latest.columns and "equity" in latest.columns:
-        debt_equity = latest["debt"] / latest["equity"]
-    else:
-        debt_equity = pd.Series([pd.NA] * len(latest))
+    # Normalize dividend yield:
+    # Some feeds store yield as percent (e.g., 6.2) instead of fraction (0.062).
+    latest.loc[latest["divyield"] > 1, "divyield"] = latest.loc[latest["divyield"] > 1, "divyield"] / 100.0
 
-    latest["debt_equity_calc"] = pd.to_numeric(debt_equity, errors="coerce")
+    # Long-term debt to equity ratio (your screener setting)
+    latest["lt_debt_equity"] = latest["debtnc"] / latest["equity"]
+    latest["lt_debt_equity"] = pd.to_numeric(latest["lt_debt_equity"], errors="coerce")
 
-    # Apply Wilson's Algorithm
-    # - Dividend yield >= 10Y treasury
-    # - PE <= 13
-    # - PB <= 1
-    # - Long-term debt/equity <= 1 (proxy as above)
-    latest["passes"] = (
-        latest["divyield"].notna()
-        & (latest["divyield"] >= TREASURY_10Y)
-        & latest["pe"].notna()
-        & (latest["pe"] <= 13)
-        & latest["pb"].notna()
-        & (latest["pb"] <= 1)
-        & latest["debt_equity_calc"].notna()
-        & (latest["debt_equity_calc"] <= 1)
-    )
+    # Rule flags (useful for debugging / confidence)
+    latest["rule_div"] = latest["divyield"].notna() & (latest["divyield"] >= TREASURY_10Y)
+    latest["rule_pe"] = latest["pe"].notna() & (latest["pe"] <= 13)
+    latest["rule_pb"] = latest["pb"].notna() & (latest["pb"] <= 1)
+    latest["rule_ltde"] = latest["lt_debt_equity"].notna() & (latest["lt_debt_equity"] <= 1)
 
-    winners = latest[latest["passes"]].copy()
-    winners = winners.sort_values("divyield", ascending=False)
+    latest["passes"] = latest["rule_div"] & latest["rule_pe"] & latest["rule_pb"] & latest["rule_ltde"]
+
+    winners = latest[latest["passes"]].copy().sort_values("divyield", ascending=False)
 
     pass_list = []
     for _, r in winners.iterrows():
-        price_date = r["calendardate"]
+        cd = r["calendardate"]
         pass_list.append(
             {
                 "ticker": r["ticker"],
@@ -146,15 +129,26 @@ def main() -> None:
                 "pe": round(float(r["pe"]), 4) if pd.notna(r["pe"]) else None,
                 "pb": round(float(r["pb"]), 4) if pd.notna(r["pb"]) else None,
                 "divYield": round(float(r["divyield"]), 6) if pd.notna(r["divyield"]) else None,
-                "debtEquity": round(float(r["debt_equity_calc"]), 4) if pd.notna(r["debt_equity_calc"]) else None,
-                "priceDate": str(price_date.date()) if pd.notna(price_date) else None,
+                "ltDebtEquity": round(float(r["lt_debt_equity"]), 4) if pd.notna(r["lt_debt_equity"]) else None,
+                "priceDate": str(cd.date()) if pd.notna(cd) else None,
             }
         )
+
+    stats = {
+        "totalTickersEvaluated": int(len(latest)),
+        "asOfCalendardateMax": str(latest["calendardate"].max().date()) if latest["calendardate"].notna().any() else None,
+        "rule_div_pass": int(latest["rule_div"].sum()),
+        "rule_pe_pass": int(latest["rule_pe"].sum()),
+        "rule_pb_pass": int(latest["rule_pb"].sum()),
+        "rule_ltde_pass": int(latest["rule_ltde"].sum()),
+        "all_rules_pass": int(latest["passes"].sum()),
+    }
 
     out = {
         "runDate": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "treasuryYield10y": TREASURY_10Y,
         "dimension": "ART",
+        "stats": stats,
         "pass": pass_list,
     }
 
@@ -162,6 +156,7 @@ def main() -> None:
         json.dump(out, f, indent=2)
 
     print(f"Wrote passlist.json with {len(pass_list)} PASS tickers")
+    print("Stats:", stats)
 
 
 if __name__ == "__main__":
