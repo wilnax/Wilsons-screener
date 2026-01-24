@@ -1,41 +1,173 @@
-name: Weekly Wilson Screener
+import os
+import json
+import datetime
+import requests
+import pandas as pd
 
-on:
-  schedule:
-    - cron: "0 22 * * 4"
-    - cron: "0 23 * * 4"
-  workflow_dispatch:
+API_KEY = os.environ.get("NASDAQ_API_KEY")
+if not API_KEY:
+    raise SystemExit("Missing NASDAQ_API_KEY")
 
-permissions:
-  contents: write
+# Set manually via GitHub variable TREASURY_10Y (example: 0.045 = 4.5%)
+TREASURY_10Y = float(os.environ.get("TREASURY_10Y", "0.045"))
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
+BASE = "https://data.nasdaq.com/api/v3/datatables"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
-      - name: Install deps
-        run: pip install requests pandas
+def get_json(url: str, params: dict, timeout: int = 120) -> dict:
+    r = requests.get(url, params=params, timeout=timeout)
+    if not r.ok:
+        # Print a snippet to logs so errors are visible in Actions
+        print("HTTP", r.status_code, r.text[:500])
+        r.raise_for_status()
+    return r.json()
 
-      - name: Run screener
-        env:
-          NASDAQ_API_KEY: ${{ secrets.NASDAQ_API_KEY }}
-          TREASURY_10Y: ${{ vars.TREASURY_10Y }}
-        run: python run_screener.py
 
-      - name: Commit passlist.json
-        run: |
-          git config user.name "wilson-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add passlist.json
-          git commit -m "Update passlist" || echo "No changes"
-          git push
+def download_csv(url: str, params: dict, timeout: int = 300) -> pd.DataFrame:
+    r = requests.get(url, params=params, timeout=timeout)
+    if not r.ok:
+        print("HTTP", r.status_code, r.text[:500])
+        r.raise_for_status()
+    return pd.read_csv(pd.io.common.BytesIO(r.content))
+
+
+def latest_trading_day_close() -> str:
+    """
+    Nasdaq Data Link datatables endpoint can be picky about qopts.sort syntax.
+    So we avoid sorting and instead fetch a small batch of rows and take max(date).
+    """
+    url = f"{BASE}/SHARADAR/SEP.json"
+    params = {
+        "api_key": API_KEY,
+        "qopts.columns": "date",
+        "qopts.per_page": 1000,  # small sample; enough to include the latest date
+    }
+    j = get_json(url, params)
+    cols = [c["name"] for c in j["datatable"]["columns"]]
+    dates = [dict(zip(cols, row))["date"] for row in j["datatable"]["data"]]
+    if not dates:
+        raise SystemExit("SEP returned no dates. Check SHARADAR/SEP access.")
+    return max(dates)
+
+
+def load_sep_closes(latest_date: str) -> pd.DataFrame:
+    """
+    Download close prices for all tickers on the latest trading day.
+    """
+    url = f"{BASE}/SHARADAR/SEP.csv"
+    params = {
+        "api_key": API_KEY,
+        "date": latest_date,
+        "qopts.columns": "ticker,close",
+        "qopts.export": "true",
+    }
+    df = download_csv(url, params)
+    df.columns = [c.lower() for c in df.columns]
+    df = df.dropna(subset=["ticker", "close"])
+    df = df.drop_duplicates(subset=["ticker"])
+    return df
+
+
+def load_sf1_latest() -> pd.DataFrame:
+    """
+    Download fundamentals needed for Wilson's Algorithm.
+    - ART: trailing 12-month style (eps, dividends per share TTM)
+    - MRQ: most recent quarter (book value per share, debt, equity)
+    """
+    url = f"{BASE}/SHARADAR/SF1.csv"
+    params = {
+        "api_key": API_KEY,
+        "dimension": "ART,MRQ",
+        "qopts.columns": "ticker,dimension,calendardate,lastupdated,epsusd,bvps,dpsttm,debtlt,equity",
+        "qopts.export": "true",
+    }
+    df = download_csv(url, params)
+    df.columns = [c.lower() for c in df.columns]
+    return df
+
+
+def pick_latest_by_dim(df: pd.DataFrame, dim: str) -> pd.DataFrame:
+    """
+    For each ticker, pick the latest row for the requested dimension.
+    """
+    sub = df[df["dimension"] == dim].copy()
+    sub["calendardate"] = pd.to_datetime(sub["calendardate"], errors="coerce")
+    sub["lastupdated"] = pd.to_datetime(sub["lastupdated"], errors="coerce")
+    sub = sub.sort_values(["ticker", "calendardate", "lastupdated"])
+    return sub.groupby("ticker", as_index=False).tail(1)
+
+
+def main():
+    # 1) Latest close date + closes
+    latest_date = latest_trading_day_close()
+    closes = load_sep_closes(latest_date)
+
+    # 2) Fundamentals snapshot
+    sf1 = load_sf1_latest()
+
+    required_cols = {"ticker", "dimension", "calendardate", "epsusd", "bvps", "debtlt", "equity"}
+    missing = required_cols - set(sf1.columns)
+    if missing:
+        raise SystemExit(
+            f"SF1 missing columns: {sorted(missing)}. "
+            f"Your SF1 schema may differ—tell me this message and I’ll adapt qopts.columns."
+        )
+
+    art = pick_latest_by_dim(sf1, "ART")
+    mrq = pick_latest_by_dim(sf1, "MRQ")
+
+    # 3) Merge close + fundamentals
+    df = closes.merge(art, on="ticker", how="inner")
+    df = df.merge(mrq[["ticker", "bvps", "debtlt", "equity"]], on="ticker", how="left")
+
+    # 4) Compute ratios
+    df["pe"] = df["close"] / df["epsusd"]
+    df["pb"] = df["close"] / df["bvps"]
+    df["debt_equity"] = df["debtlt"] / df["equity"]
+
+    if "dpsttm" in df.columns:
+        df["div_yield"] = df["dpsttm"] / df["close"]
+    else:
+        df["div_yield"] = pd.NA
+
+    for col in ["pe", "pb", "debt_equity", "div_yield", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 5) Apply Wilson rules
+    df["passes"] = (
+        (df["div_yield"].notna()) &
+        (df["div_yield"] >= TREASURY_10Y) &
+        (df["pe"] <= 13) &
+        (df["pb"] <= 1) &
+        (df["debt_equity"] <= 1)
+    )
+
+    winners = df[df["passes"]].copy().sort_values("div_yield", ascending=False)
+
+    pass_list = []
+    for _, r in winners.iterrows():
+        pass_list.append({
+            "ticker": r["ticker"],
+            "price": round(float(r["close"]), 2) if pd.notna(r["close"]) else None,
+            "pe": round(float(r["pe"]), 4) if pd.notna(r["pe"]) else None,
+            "pb": round(float(r["pb"]), 4) if pd.notna(r["pb"]) else None,
+            "divYield": round(float(r["div_yield"]), 6) if pd.notna(r["div_yield"]) else None,
+            "debtEquity": round(float(r["debt_equity"]), 4) if pd.notna(r["debt_equity"]) else None,
+            "priceDate": str(latest_date),
+        })
+
+    out = {
+        "runDate": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "asOfPriceDate": str(latest_date),
+        "treasuryYield10y": TREASURY_10Y,
+        "pass": pass_list
+    }
+
+    with open("passlist.json", "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"Wrote passlist.json with {len(pass_list)} PASS tickers")
+
+
+if __name__ == "__main__":
+    main()
