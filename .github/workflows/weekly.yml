@@ -2,15 +2,12 @@ name: Weekly Wilson Screener
 
 on:
   schedule:
-    # Thursday 22:00 UTC (covers 6pm ET during daylight time)
     - cron: "0 22 * * 4"
-    # Thursday 23:00 UTC (covers 6pm ET during standard time)
     - cron: "0 23 * * 4"
   workflow_dispatch:
 
 permissions:
   contents: write
-
 
 jobs:
   run:
@@ -25,15 +22,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          
+
       - name: Install deps
         run: pip install requests pandas
-        
+
       - name: Run screener
         env:
           NASDAQ_API_KEY: ${{ secrets.NASDAQ_API_KEY }}
           TREASURY_10Y: ${{ vars.TREASURY_10Y }}
-                
+        run: python run_screener.py
+
       - name: Commit passlist.json
         run: |
           git config user.name "wilson-bot"
@@ -41,6 +39,3 @@ jobs:
           git add passlist.json
           git commit -m "Update passlist" || echo "No changes"
           git push
-        run: python run_screener.py
-
-    
