@@ -26,84 +26,96 @@ def get_json(url: str, params: dict, timeout: int = 120) -> dict:
     return resp.json()
 
 
-def download_csv(url: str, params: dict, timeout: int = 300) -> pd.DataFrame:
-    resp = requests.get(url, params=params, timeout=timeout)
-    _raise_with_context(resp)
-    return pd.read_csv(pd.io.common.BytesIO(resp.content))
+def fetch_datatable_all_rows(code: str, params: dict, timeout: int = 120, max_pages: int = 200) -> pd.DataFrame:
+    """
+    Fetch all rows from a Nasdaq Data Link datatable using JSON pagination.
+    Returns a pandas DataFrame with lowercased columns.
+    """
+    url = f"{BASE}/{code}.json"
+    all_rows = []
+    columns = None
+
+    # datatables uses `next_cursor_id` for pagination when results are large
+    cursor = None
+    for _ in range(max_pages):
+        p = dict(params)
+        p["api_key"] = API_KEY
+        if cursor:
+            p["qopts.cursor_id"] = cursor
+
+        j = get_json(url, p, timeout=timeout)
+
+        dt = j.get("datatable", {})
+        if columns is None:
+            columns = [c["name"] for c in dt.get("columns", [])]
+            if not columns:
+                raise SystemExit(f"No columns returned for {code}. Check access/params.")
+
+        data = dt.get("data", [])
+        all_rows.extend(data)
+
+        cursor = j.get("meta", {}).get("next_cursor_id")
+        if not cursor:
+            break
+
+    df = pd.DataFrame(all_rows, columns=[c.lower() for c in columns])
+    return df
 
 
 def latest_trading_day_from_sep() -> str:
-    url = f"{BASE}/SHARADAR/SEP.json"
-    params = {
-        "api_key": API_KEY,
-        "qopts.columns": "date",
-        "qopts.per_page": 1000,
-    }
-    j = get_json(url, params)
-    cols = [c["name"] for c in j["datatable"]["columns"]]
-    if "date" not in cols:
-        raise SystemExit(f"SEP JSON did not include 'date'. Columns: {cols}")
-
-    dates = []
-    for row in j["datatable"]["data"]:
-        d = dict(zip(cols, row)).get("date")
-        if d:
-            dates.append(d)
-    if not dates:
-        raise SystemExit("Could not determine latest date from SEP sample.")
-    return max(dates)
-
-
-def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols = list(df.columns)
-    for c in candidates:
-        if c in cols:
-            return c
-    return None
+    """
+    Determine latest trading date from SEP using a small sample and max(date).
+    """
+    df = fetch_datatable_all_rows(
+        "SHARADAR/SEP",
+        params={
+            "qopts.columns": "date",
+            "qopts.per_page": 1000,
+        },
+        max_pages=5,
+    )
+    if "date" not in df.columns or df.empty:
+        raise SystemExit("Could not determine latest date from SEP.")
+    # Dates come as strings like YYYY-MM-DD
+    return str(df["date"].max())
 
 
 def load_sep_closes(latest_date: str) -> pd.DataFrame:
     """
-    Download close prices for all tickers on a given date.
-    Make this robust to schema differences by auto-detecting columns.
+    Get ticker + close for all tickers on latest_date from SEP via JSON paging.
     """
-    url = f"{BASE}/SHARADAR/SEP.csv"
-    params = {
-        "api_key": API_KEY,
-        "date": latest_date,
-        # Ask for the expected columns, but don't assume they'll come back exactly.
-        "qopts.columns": "ticker,close",
-        "qopts.export": "true",
-    }
-    df = download_csv(url, params)
-    df.columns = [c.strip().lower() for c in df.columns]
+    df = fetch_datatable_all_rows(
+        "SHARADAR/SEP",
+        params={
+            "date": latest_date,
+            "qopts.columns": "ticker,close",
+            "qopts.per_page": 10000,
+        },
+        max_pages=50,
+        timeout=180,
+    )
+    # Normalize and keep only needed
+    if "ticker" not in df.columns or "close" not in df.columns:
+        raise SystemExit(f"SEP missing expected columns. Got: {list(df.columns)}")
 
-    ticker_col = _find_col(df, ["ticker", "symbol"])
-    close_col = _find_col(df, ["close", "adj_close", "closeadj", "close_adj", "closeadjusted", "adjclose"])
-
-    if ticker_col is None or close_col is None:
-        print("SEP.csv columns returned:", list(df.columns))
-        raise SystemExit(
-            "Could not find ticker/close columns in SEP.csv. "
-            "See printed columns above; we will map them."
-        )
-
-    out = df[[ticker_col, close_col]].copy()
-    out = out.rename(columns={ticker_col: "ticker", close_col: "close"})
-    out = out.dropna(subset=["ticker", "close"]).drop_duplicates(subset=["ticker"])
-    return out
+    df = df.dropna(subset=["ticker", "close"]).drop_duplicates(subset=["ticker"])
+    return df[["ticker", "close"]]
 
 
 def load_sf1_latest() -> pd.DataFrame:
-    url = f"{BASE}/SHARADAR/SF1.csv"
-    params = {
-        "api_key": API_KEY,
-        "dimension": "ART,MRQ",
-        "qopts.columns": "ticker,dimension,calendardate,lastupdated,epsusd,bvps,dpsttm,debtlt,equity",
-        "qopts.export": "true",
-    }
-    df = download_csv(url, params)
-    df.columns = [c.strip().lower() for c in df.columns]
+    """
+    Pull SF1 fundamentals (ART + MRQ) via JSON paging.
+    """
+    df = fetch_datatable_all_rows(
+        "SHARADAR/SF1",
+        params={
+            "dimension": "ART,MRQ",
+            "qopts.columns": "ticker,dimension,calendardate,lastupdated,epsusd,bvps,dpsttm,debtlt,equity",
+            "qopts.per_page": 10000,
+        },
+        max_pages=200,
+        timeout=180,
+    )
     return df
 
 
@@ -120,13 +132,11 @@ def main() -> None:
     closes = load_sep_closes(latest_date)
 
     sf1 = load_sf1_latest()
+
     required = {"ticker", "dimension", "calendardate", "epsusd", "bvps", "debtlt", "equity"}
     missing = required - set(sf1.columns)
     if missing:
-        raise SystemExit(
-            f"SF1 missing columns: {sorted(missing)}. "
-            f"Your SF1 schema may differ; paste this line to me and I’ll tailor it."
-        )
+        raise SystemExit(f"SF1 missing columns: {sorted(missing)}")
 
     art = pick_latest_by_dimension(sf1, "ART")
     mrq = pick_latest_by_dimension(sf1, "MRQ")
@@ -134,6 +144,7 @@ def main() -> None:
     df = closes.merge(art, on="ticker", how="inner")
     df = df.merge(mrq[["ticker", "bvps", "debtlt", "equity"]], on="ticker", how="left")
 
+    # Compute metrics
     df["pe"] = df["close"] / df["epsusd"]
     df["pb"] = df["close"] / df["bvps"]
     df["debt_equity"] = df["debtlt"] / df["equity"]
