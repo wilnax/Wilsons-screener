@@ -26,6 +26,7 @@ jobs:
       - name: Run screener
         env:
           NASDAQ_API_KEY: ${{ secrets.NASDAQ_API_KEY }}
+          TREASURY_10Y: ${{ vars.TREASURY_10Y }}
         run: python run_screener.py
 
       - name: Commit passlist.json
