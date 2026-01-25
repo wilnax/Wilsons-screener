@@ -1,6 +1,7 @@
 import os
 import json
 import datetime as dt
+import time
 import requests
 import pandas as pd
 
@@ -8,16 +9,23 @@ FMP_API_KEY = os.environ.get("FMP_API_KEY")
 if not FMP_API_KEY:
     raise SystemExit("Missing FMP_API_KEY (GitHub Secret).")
 
-# 4.23% => 0.0423
 TREASURY_10Y = float(os.environ.get("TREASURY_10Y", "0.0423"))
 
-# Legacy API v3 stock screener (returns valuation/leverage/yield fields in the payload)
-SCREENER_URL = "https://financialmodelingprep.com/api/v3/stock-screener"
+# Stable endpoints (supported for new users)
+COMPANY_SCREENER_URL = "https://financialmodelingprep.com/stable/company-screener"
+RATIOS_TTM_URL = "https://financialmodelingprep.com/stable/ratios-ttm"
+KEY_METRICS_TTM_URL = "https://financialmodelingprep.com/stable/key-metrics-ttm"
 
 ALLOWED_EXCHANGES = {"NYSE", "NASDAQ", "AMEX"}
 
+# Be gentle to avoid rate limits
+SLEEP_BETWEEN_CALLS_SEC = 0.12
 
-def _get_json(url: str, params: dict, timeout: int = 240):
+# Hard cap so Actions doesn't run forever on the first try
+MAX_TICKERS_TO_EVALUATE = 2500
+
+
+def _get_json(url: str, params: dict, timeout: int = 180):
     r = requests.get(url, params=params, timeout=timeout)
     if not r.ok:
         snippet = (r.text or "")[:2000]
@@ -36,10 +44,7 @@ def _to_float(x):
 
 
 def _normalize_div_yield(dy):
-    """
-    FMP sometimes returns dividendYield as 0.034 (fraction) or 3.4 (percent).
-    Normalize to fraction.
-    """
+    # Normalize dividend yield to fraction (0.034 not 3.4)
     dy = _to_float(dy)
     if dy is None:
         return None
@@ -48,180 +53,200 @@ def _normalize_div_yield(dy):
     return dy
 
 
-def main() -> None:
-    run_date = dt.datetime.now(dt.timezone.utc).isoformat()
+def _pick(d: dict, keys: list[str]):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
 
-    # Ask the server to do the heavy filtering
-    # Common param names for this endpoint:
-    #   - country=US
-    #   - exchange=NASDAQ,NYSE,AMEX   (sometimes "exchange" is required, sometimes ignored)
-    #   - dividendMoreThan=...
-    #   - peLowerThan=...
-    #   - priceToBookRatioLowerThan=...
-    #   - debtToEquityLowerThan=...
+
+def fetch_us_universe_from_company_screener(limit: int = 10000) -> pd.DataFrame:
+    """
+    Uses stable/company-screener which you already confirmed returns:
+    symbol, price, exchangeShortName, lastAnnualDividend, ...
+    """
     params = {
         "apikey": FMP_API_KEY,
         "country": "US",
-        "exchange": "NASDAQ,NYSE,AMEX",
-        "limit": 10000,
-
-        "dividendMoreThan": TREASURY_10Y,
-        "peLowerThan": 13,
-        "priceToBookRatioLowerThan": 1,
-        "debtToEquityLowerThan": 1,
+        "isEtf": "false",
+        "isFund": "false",
+        "isActivelyTrading": "true",
+        "limit": limit,
     }
-
-    data = _get_json(SCREENER_URL, params, timeout=240)
-
+    data = _get_json(COMPANY_SCREENER_URL, params, timeout=240)
     if not isinstance(data, list):
-        raise SystemExit(f"Unexpected response type from stock-screener: {type(data)}")
-
-    if len(data) == 0:
-        out = {
-            "runDate": run_date,
-            "stats": {
-                "treasuryYield10y": TREASURY_10Y,
-                "rowsFromApi": 0,
-                "afterLocalFilter": 0,
-                "all_rules_pass": 0,
-                "notes": "API returned 0 rows after server-side filters. Could be strict thresholds or different field availability."
-            },
-            "pass": [],
-            "topCandidates": []
-        }
-        with open("passlist.json", "w") as f:
-            json.dump(out, f, indent=2)
-        pd.DataFrame([]).to_csv("passlist.csv", index=False)
-        print("Wrote passlist.json (0 rows)")
-        return
-
+        raise SystemExit(f"Unexpected company-screener response type: {type(data)}")
     df = pd.DataFrame(data)
+    if df.empty:
+        raise SystemExit("company-screener returned 0 rows (unexpected).")
+    return df
 
-    # Print columns once in Actions logs if something goes sideways
-    cols = set(df.columns)
 
-    def need(colname: str):
-        if colname not in cols:
-            print("Columns returned:", sorted(list(cols)))
-            raise SystemExit(f"Missing required column '{colname}' in stock-screener response.")
+def fetch_ratios_ttm(symbol: str) -> dict | None:
+    params = {"apikey": FMP_API_KEY, "symbol": symbol}
+    data = _get_json(RATIOS_TTM_URL, params, timeout=180)
+    time.sleep(SLEEP_BETWEEN_CALLS_SEC)
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        return data[0]
+    return None
 
-    # Required fields we expect from stock-screener
-    need("symbol")
-    need("price")
 
-    # These are sometimes named slightly differently; try a few options
-    pe_col = "pe" if "pe" in cols else ("peRatio" if "peRatio" in cols else None)
-    pb_col = "priceToBookRatio" if "priceToBookRatio" in cols else ("pb" if "pb" in cols else None)
-    dy_col = "dividendYield" if "dividendYield" in cols else ("divYield" if "divYield" in cols else None)
-    de_col = "debtToEquity" if "debtToEquity" in cols else ("debtEquityRatio" if "debtEquityRatio" in cols else None)
+def fetch_key_metrics_ttm(symbol: str) -> dict | None:
+    params = {"apikey": FMP_API_KEY, "symbol": symbol}
+    data = _get_json(KEY_METRICS_TTM_URL, params, timeout=180)
+    time.sleep(SLEEP_BETWEEN_CALLS_SEC)
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        return data[0]
+    return None
 
-    missing = [name for name, col in [
-        ("pe", pe_col),
-        ("pb", pb_col),
-        ("dividendYield", dy_col),
-        ("debtToEquity", de_col),
-    ] if col is None]
 
-    if missing:
-        print("Columns returned:", sorted(list(cols)))
-        raise SystemExit(
-            "The stock-screener endpoint did not return the ratio fields we need: "
-            f"{missing}. If your plan excludes these, we can compute them using other endpoints."
-        )
+def main() -> None:
+    run_date = dt.datetime.now(dt.timezone.utc).isoformat()
 
-    # Normalize
-    df = df.rename(columns={
-        "symbol": "ticker",
-        pe_col: "pe",
-        pb_col: "pb",
-        dy_col: "divYield",
-        de_col: "debtEquity",
-    }).copy()
+    raw = fetch_us_universe_from_company_screener(limit=10000)
 
-    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-    if "exchangeShortName" in cols:
-        df["exchange"] = df["exchangeShortName"].astype(str).str.upper().str.strip()
-    elif "exchange" in cols:
-        df["exchange"] = df["exchange"].astype(str).str.upper().str.strip()
-    else:
-        df["exchange"] = ""
+    # Normalize expected columns from your returned list
+    needed = ["symbol", "price"]
+    for c in needed:
+        if c not in raw.columns:
+            raise SystemExit(f"company-screener missing '{c}'. Columns: {list(raw.columns)}")
+
+    exch_col = "exchangeShortName" if "exchangeShortName" in raw.columns else ("exchange" if "exchange" in raw.columns else None)
+    if exch_col is None:
+        raise SystemExit(f"company-screener missing exchange field. Columns: {list(raw.columns)}")
+
+    div_col = "lastAnnualDividend" if "lastAnnualDividend" in raw.columns else None
+    if div_col is None:
+        raise SystemExit("company-screener did not return lastAnnualDividend; cannot prefilter dividend yield.")
+
+    df = raw.rename(columns={exch_col: "exchange", div_col: "lastAnnualDividend"}).copy()
+    df["ticker"] = df["symbol"].astype(str).str.upper().str.strip()
+    df["exchange"] = df["exchange"].astype(str).str.upper().str.strip()
 
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df["pe"] = pd.to_numeric(df["pe"], errors="coerce")
-    df["pb"] = pd.to_numeric(df["pb"], errors="coerce")
-    df["debtEquity"] = pd.to_numeric(df["debtEquity"], errors="coerce")
-    df["divYield"] = df["divYield"].apply(_normalize_div_yield)
+    df["lastAnnualDividend"] = pd.to_numeric(df["lastAnnualDividend"], errors="coerce")
 
-    # Keep only main US exchanges if exchange info exists
-    if df["exchange"].str.len().gt(0).any():
-        df = df[df["exchange"].isin(ALLOWED_EXCHANGES)].copy()
+    # Filter to main US exchanges
+    df = df[df["exchange"].isin(ALLOWED_EXCHANGES)].copy()
+    df = df.dropna(subset=["ticker", "price"])
+    df = df[df["price"] > 0].copy()
 
-    # Local enforcement (so we control pass/fail)
-    df["rule_div"] = df["divYield"].notna() & (df["divYield"] >= TREASURY_10Y)
-    df["rule_pe"] = df["pe"].notna() & (df["pe"] <= 13)
-    df["rule_pb"] = df["pb"].notna() & (df["pb"] <= 1)
-    df["rule_de"] = df["debtEquity"].notna() & (df["debtEquity"] <= 1)
+    # Estimated dividend yield from company-screener fields
+    # (This is only to reduce calls; final yield can come from TTM endpoints if available.)
+    df["divYield_est"] = df["lastAnnualDividend"] / df["price"]
+    df["divYield_est"] = df["divYield_est"].apply(_normalize_div_yield)
 
-    df["passes"] = df["rule_div"] & df["rule_pe"] & df["rule_pb"] & df["rule_de"]
-    df["rulesPassed"] = (
-        df["rule_div"].astype(int) +
-        df["rule_pe"].astype(int) +
-        df["rule_pb"].astype(int) +
-        df["rule_de"].astype(int)
-    )
+    # Stage 1 filter: only those with estimated yield >= 10Y
+    stage1 = df[df["divYield_est"].notna() & (df["divYield_est"] >= TREASURY_10Y)].copy()
 
-    winners = df[df["passes"]].copy().sort_values(["divYield", "pe"], ascending=[False, True])
+    # Cap evaluation for reliability on first run
+    stage1 = stage1.sort_values("divYield_est", ascending=False).head(MAX_TICKERS_TO_EVALUATE)
 
-    pass_list = []
-    for _, r in winners.iterrows():
-        pass_list.append({
-            "ticker": r["ticker"],
-            "exchange": r["exchange"] if isinstance(r["exchange"], str) else "",
-            "price": None if pd.isna(r["price"]) else round(float(r["price"]), 2),
-            "divYield": None if pd.isna(r["divYield"]) else round(float(r["divYield"]), 6),
-            "pe": None if pd.isna(r["pe"]) else round(float(r["pe"]), 4),
-            "pb": None if pd.isna(r["pb"]) else round(float(r["pb"]), 4),
-            "debtEquity": None if pd.isna(r["debtEquity"]) else round(float(r["debtEquity"]), 4),
+    results = []
+    errors = 0
+
+    for _, row in stage1.iterrows():
+        sym = row["ticker"]
+        px = float(row["price"])
+        exch = row["exchange"]
+
+        ratios = fetch_ratios_ttm(sym)
+        metrics = None
+
+        # Extract PE, PB, DE from ratios-ttm if possible
+        pe = pb = debt_equity = div_yield = None
+
+        if ratios:
+            pe = _to_float(_pick(ratios, ["peRatioTTM", "peRatio", "priceToEarningsRatioTTM", "priceToEarningsRatio"]))
+            pb = _to_float(_pick(ratios, ["priceToBookRatioTTM", "priceToBookRatio", "pbRatioTTM", "pbRatio"]))
+            debt_equity = _to_float(_pick(ratios, ["debtEquityRatioTTM", "debtEquityRatio", "debtToEquity", "debtToEquityRatio"]))
+            div_yield = _normalize_div_yield(_pick(ratios, ["dividendYieldTTM", "dividendYield"]))
+
+        # If PB or DE or PE missing, try key-metrics-ttm fallback
+        if pe is None or pb is None or debt_equity is None or div_yield is None:
+            metrics = fetch_key_metrics_ttm(sym)  # fallback
+
+        if metrics:
+            if pe is None:
+                pe = _to_float(_pick(metrics, ["peRatioTTM", "peRatio"]))
+            if pb is None:
+                pb = _to_float(_pick(metrics, ["pbRatioTTM", "pbRatio", "priceToBookRatioTTM", "priceToBookRatio"]))
+            if debt_equity is None:
+                debt_equity = _to_float(_pick(metrics, ["debtEquityRatioTTM", "debtEquityRatio", "debtToEquity", "debtToEquityRatio"]))
+            if div_yield is None:
+                div_yield = _normalize_div_yield(_pick(metrics, ["dividendYieldTTM", "dividendYield"]))
+
+        # Final yield fallback: use estimated yield if TTM yield isn't available
+        if div_yield is None:
+            div_yield = _normalize_div_yield(row["divYield_est"])
+
+        # If still missing required metrics, skip but count as error
+        if pe is None or pb is None or debt_equity is None or div_yield is None:
+            errors += 1
+            continue
+
+        rule_div = div_yield >= TREASURY_10Y
+        rule_pe = pe <= 13
+        rule_pb = pb <= 1
+        rule_de = debt_equity <= 1
+
+        passes = rule_div and rule_pe and rule_pb and rule_de
+
+        results.append({
+            "ticker": sym,
+            "exchange": exch,
+            "price": round(px, 2),
+            "divYield": round(float(div_yield), 6),
+            "pe": round(float(pe), 4),
+            "pb": round(float(pb), 4),
+            "debtEquity": round(float(debt_equity), 4),
+            "rule_div": bool(rule_div),
+            "rule_pe": bool(rule_pe),
+            "rule_pb": bool(rule_pb),
+            "rule_de": bool(rule_de),
+            "passes": bool(passes),
         })
 
-    top = df.sort_values(["rulesPassed", "divYield"], ascending=[False, False]).head(60)
-    top_candidates = []
-    for _, r in top.iterrows():
-        top_candidates.append({
-            "ticker": r["ticker"],
-            "exchange": r["exchange"] if isinstance(r["exchange"], str) else "",
-            "rulesPassed": int(r["rulesPassed"]),
-            "price": None if pd.isna(r["price"]) else round(float(r["price"]), 2),
-            "divYield": None if pd.isna(r["divYield"]) else round(float(r["divYield"]), 6),
-            "pe": None if pd.isna(r["pe"]) else round(float(r["pe"]), 4),
-            "pb": None if pd.isna(r["pb"]) else round(float(r["pb"]), 4),
-            "debtEquity": None if pd.isna(r["debtEquity"]) else round(float(r["debtEquity"]), 4),
-        })
+    out_df = pd.DataFrame(results)
+
+    if out_df.empty:
+        pass_df = out_df
+        top_df = out_df
+    else:
+        pass_df = out_df[out_df["passes"]].sort_values(["divYield", "pe"], ascending=[False, True])
+        out_df["rulesPassed"] = (
+            out_df["rule_div"].astype(int) +
+            out_df["rule_pe"].astype(int) +
+            out_df["rule_pb"].astype(int) +
+            out_df["rule_de"].astype(int)
+        )
+        top_df = out_df.sort_values(["rulesPassed", "divYield"], ascending=[False, False]).head(60)
 
     stats = {
         "treasuryYield10y": TREASURY_10Y,
-        "rowsFromApi": int(len(df)),
-        "div_rule_pass": int(df["rule_div"].sum()),
-        "pe_rule_pass": int(df["rule_pe"].sum()),
-        "pb_rule_pass": int(df["rule_pb"].sum()),
-        "de_rule_pass": int(df["rule_de"].sum()),
-        "all_rules_pass": int(df["passes"].sum()),
+        "universeFromCompanyScreener": int(len(df)),
+        "stage1_dividend_prefilter_count": int(len(stage1)),
+        "evaluated_count": int(len(results)),
+        "skipped_missing_metrics": int(errors),
+        "div_rule_pass": int(pass_df.shape[0]) if not out_df.empty else 0,  # not perfect, but ok
+        "all_rules_pass": int(pass_df.shape[0]) if not out_df.empty else 0,
+        "notes": "Uses stable/company-screener for universe + lastAnnualDividend prefilter, then stable ratios-ttm / key-metrics-ttm per symbol."
     }
 
-    out = {
+    payload = {
         "runDate": run_date,
         "stats": stats,
-        "pass": pass_list,
-        "topCandidates": top_candidates
+        "pass": pass_df.drop(columns=["passes"], errors="ignore").to_dict(orient="records") if not pass_df.empty else [],
+        "topCandidates": top_df.to_dict(orient="records") if not top_df.empty else [],
     }
 
     with open("passlist.json", "w") as f:
-        json.dump(out, f, indent=2)
+        json.dump(payload, f, indent=2)
 
-    pd.DataFrame(pass_list).to_csv("passlist.csv", index=False)
+    pass_df.to_csv("passlist.csv", index=False)
 
     print("Stats:", stats)
-    print(f"Wrote passlist.json and passlist.csv with {len(pass_list)} PASS tickers")
+    print(f"Wrote passlist.json and passlist.csv with {len(pass_df)} PASS tickers")
 
 
 if __name__ == "__main__":
