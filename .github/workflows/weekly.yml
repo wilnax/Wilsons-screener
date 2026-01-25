@@ -3,7 +3,7 @@ name: Weekly Wilson Screener
 on:
   workflow_dispatch:
   schedule:
-    # Thursday 6:00pm US/Eastern (Jan = 23:00 UTC). Safe to include 22:00 too for DST shifts.
+    # Thursday 6pm Eastern ≈ 23:00 UTC during standard time, 22:00 UTC during DST
     - cron: "0 22 * * 4"
     - cron: "0 23 * * 4"
 
@@ -37,6 +37,6 @@ jobs:
         run: |
           git config user.name "wilson-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add passlist.json
+          git add passlist.json passlist.csv
           git commit -m "Update passlist" || echo "No changes"
           git push
