@@ -39,6 +39,6 @@ jobs:
         run: |
           git config user.name "wilson-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add passlist.json passlist.csv
+          git add passlist.json passlist.csv debug_ratios_*.json debug_metrics_*.json
           git commit -m "Update passlist" || echo "No changes"
           git push
