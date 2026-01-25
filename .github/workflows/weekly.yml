@@ -3,6 +3,7 @@ name: Weekly Wilson Screener
 on:
   workflow_dispatch:
   schedule:
+    # Thursday 6:00pm US/Eastern (Jan = 23:00 UTC). Safe to include 22:00 too for DST shifts.
     - cron: "0 22 * * 4"
     - cron: "0 23 * * 4"
 
@@ -28,11 +29,11 @@ jobs:
 
       - name: Run screener
         env:
-          NASDAQ_API_KEY: ${{ secrets.NASDAQ_API_KEY }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           TREASURY_10Y: ${{ vars.TREASURY_10Y }}
         run: python run_screener.py
 
-      - name: Commit passlist.json
+      - name: Commit outputs
         run: |
           git config user.name "wilson-bot"
           git config user.email "actions@users.noreply.github.com"
