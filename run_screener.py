@@ -8,7 +8,9 @@ API_KEY = os.environ.get("NASDAQ_API_KEY")
 if not API_KEY:
     raise SystemExit("Missing NASDAQ_API_KEY")
 
+# Set this in GitHub Actions Variables as a DECIMAL (4.23% = 0.0423)
 TREASURY_10Y = float(os.environ.get("TREASURY_10Y", "0.0423"))
+
 BASE = "https://data.nasdaq.com/api/v3/datatables"
 
 
@@ -57,8 +59,8 @@ def fetch_datatable_all_rows(code: str, params: dict, timeout: int = 180, max_pa
 
 def get_latest_sep_date_no_sort() -> str:
     """
-    Your endpoint does NOT allow qopts.sort.
-    So we pull a sample of dates and take max(date) locally.
+    Your endpoint does NOT support qopts.sort.
+    Pull a sample and take max(date) locally.
     """
     df = fetch_datatable_all_rows(
         "SHARADAR/SEP",
@@ -66,8 +68,8 @@ def get_latest_sep_date_no_sort() -> str:
             "qopts.columns": "date",
             "qopts.per_page": 1000,
         },
-        timeout=180,
         max_pages=5,
+        timeout=180,
     )
     if df.empty or "date" not in df.columns:
         raise SystemExit("Could not determine latest SEP date (no dates returned).")
@@ -82,20 +84,31 @@ def load_sep_closes(latest_date: str) -> pd.DataFrame:
             "qopts.columns": "ticker,close",
             "qopts.per_page": 10000,
         },
+        max_pages=500,
         timeout=180,
-        max_pages=300,
     )
+
     if df.empty:
-        raise SystemExit("SEP returned 0 rows for latest_date. Your SEP access may be limited.")
+        raise SystemExit("SEP returned 0 rows for that date. Your SEP access may be limited.")
+
     if "ticker" not in df.columns or "close" not in df.columns:
         raise SystemExit(f"SEP missing expected columns. Got: {list(df.columns)}")
 
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     df = df.dropna(subset=["ticker", "close"]).drop_duplicates(subset=["ticker"])
-    return df
+    return df[["ticker", "close"]]
 
 
-def load_sf1_art_fundamentals() -> pd.DataFrame:
+def load_sf1_latest_art() -> pd.DataFrame:
+    """
+    Pull fundamentals needed to compute ratios using CURRENT price.
+    Using ART (annual trailing-ish) values:
+      - epsusd (earnings per share) for PE
+      - bvps (book value per share) for PB
+      - dps (dividends per share) for dividend yield
+      - debtnc (non-current debt; proxy for long-term debt)
+      - equity (shareholders' equity)
+    """
     df = fetch_datatable_all_rows(
         "SHARADAR/SF1",
         params={
@@ -103,8 +116,8 @@ def load_sf1_art_fundamentals() -> pd.DataFrame:
             "qopts.columns": "ticker,calendardate,lastupdated,epsusd,bvps,dps,debtnc,equity",
             "qopts.per_page": 10000,
         },
-        timeout=180,
         max_pages=500,
+        timeout=180,
     )
 
     needed = {"ticker", "calendardate", "lastupdated", "epsusd", "bvps", "dps", "debtnc", "equity"}
@@ -115,7 +128,7 @@ def load_sf1_art_fundamentals() -> pd.DataFrame:
     df["calendardate"] = pd.to_datetime(df["calendardate"], errors="coerce")
     df["lastupdated"] = pd.to_datetime(df["lastupdated"], errors="coerce")
 
-    # pick latest row per ticker
+    # Pick most recent row per ticker
     df = df.sort_values(["ticker", "calendardate", "lastupdated"])
     df = df.groupby("ticker", as_index=False).tail(1)
 
@@ -126,14 +139,17 @@ def load_sf1_art_fundamentals() -> pd.DataFrame:
 
 
 def main() -> None:
+    # 1) "Current" prices (latest date in your available SEP slice)
     latest_price_date = get_latest_sep_date_no_sort()
     closes = load_sep_closes(latest_price_date)
 
-    sf1 = load_sf1_art_fundamentals()
+    # 2) Latest fundamentals per ticker
+    sf1 = load_sf1_latest_art()
 
+    # 3) Merge universe
     df = closes.merge(sf1, on="ticker", how="inner")
 
-    # Current ratios computed from current close
+    # 4) Compute CURRENT ratios from current price
     df["pe"] = df["close"] / df["epsusd"]
     df["pb"] = df["close"] / df["bvps"]
     df["div_yield"] = df["dps"] / df["close"]
@@ -142,13 +158,12 @@ def main() -> None:
     for c in ["pe", "pb", "div_yield", "lt_debt_equity"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Apply your rules
-    df["passes"] = (
-        df["div_yield"].notna() & (df["div_yield"] >= TREASURY_10Y) &
-        df["pe"].notna() & (df["pe"] <= 13) &
-        df["pb"].notna() & (df["pb"] <= 1) &
-        df["lt_debt_equity"].notna() & (df["lt_debt_equity"] <= 1)
-    )
+    # 5) Wilson's Algorithm rules
+    df["rule_div"] = df["div_yield"].notna() & (df["div_yield"] >= TREASURY_10Y)
+    df["rule_pe"] = df["pe"].notna() & (df["pe"] <= 13)
+    df["rule_pb"] = df["pb"].notna() & (df["pb"] <= 1)
+    df["rule_ltde"] = df["lt_debt_equity"].notna() & (df["lt_debt_equity"] <= 1)
+    df["passes"] = df["rule_div"] & df["rule_pe"] & df["rule_pb"] & df["rule_ltde"]
 
     winners = df[df["passes"]].copy().sort_values("div_yield", ascending=False)
 
@@ -157,26 +172,60 @@ def main() -> None:
         pass_list.append({
             "ticker": r["ticker"],
             "price": round(float(r["close"]), 2),
-            "pe": round(float(r["pe"]), 4) if pd.notna(r["pe"]) else None,
-            "pb": round(float(r["pb"]), 4) if pd.notna(r["pb"]) else None,
-            "divYield": round(float(r["div_yield"]), 6) if pd.notna(r["div_yield"]) else None,
-            "ltDebtEquity": round(float(r["lt_debt_equity"]), 4) if pd.notna(r["lt_debt_equity"]) else None,
+            "pe": None if pd.isna(r["pe"]) else round(float(r["pe"]), 4),
+            "pb": None if pd.isna(r["pb"]) else round(float(r["pb"]), 4),
+            "divYield": None if pd.isna(r["div_yield"]) else round(float(r["div_yield"]), 6),
+            "ltDebtEquity": None if pd.isna(r["lt_debt_equity"]) else round(float(r["lt_debt_equity"]), 4),
+            "priceDate": str(latest_price_date),
+        })
+
+    stats = {
+        "asOfPriceDate": str(latest_price_date),
+        "treasuryYield10y": TREASURY_10Y,
+        "sepRows": int(len(closes)),
+        "sf1Rows": int(len(sf1)),
+        "mergedRows": int(len(df)),
+        "div_rule_pass": int(df["rule_div"].sum()),
+        "pe_rule_pass": int(df["rule_pe"].sum()),
+        "pb_rule_pass": int(df["rule_pb"].sum()),
+        "ltde_rule_pass": int(df["rule_ltde"].sum()),
+        "all_rules_pass": int(df["passes"].sum()),
+    }
+
+    # Include near-misses so you can see the closest stocks even if pass=0
+    df["rules_passed"] = (
+        df["rule_div"].astype(int) +
+        df["rule_pe"].astype(int) +
+        df["rule_pb"].astype(int) +
+        df["rule_ltde"].astype(int)
+    )
+    top = df.sort_values(["rules_passed", "div_yield"], ascending=[False, False]).head(50)
+
+    top_candidates = []
+    for _, r in top.iterrows():
+        top_candidates.append({
+            "ticker": r["ticker"],
+            "rulesPassed": int(r["rules_passed"]),
+            "price": None if pd.isna(r["close"]) else round(float(r["close"]), 2),
+            "pe": None if pd.isna(r["pe"]) else round(float(r["pe"]), 4),
+            "pb": None if pd.isna(r["pb"]) else round(float(r["pb"]), 4),
+            "divYield": None if pd.isna(r["div_yield"]) else round(float(r["div_yield"]), 6),
+            "ltDebtEquity": None if pd.isna(r["lt_debt_equity"]) else round(float(r["lt_debt_equity"]), 4),
             "priceDate": str(latest_price_date),
         })
 
     out = {
         "runDate": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "asOfPriceDate": str(latest_price_date),
-        "treasuryYield10y": TREASURY_10Y,
-        "passCount": len(pass_list),
+        "stats": stats,
         "pass": pass_list,
+        "topCandidates": top_candidates
     }
 
     with open("passlist.json", "w") as f:
         json.dump(out, f, indent=2)
 
-    print(f"Wrote passlist.json with {len(pass_list)} PASS tickers (as of {latest_price_date})")
-    print(f"Rows merged: {len(df)} | SEP rows: {len(closes)} | SF1 rows: {len(sf1)}")
+    print("Stats:", stats)
+    print(f"Wrote passlist.json with {len(pass_list)} PASS tickers")
 
 
 if __name__ == "__main__":
