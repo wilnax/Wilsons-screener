@@ -8,9 +8,7 @@ API_KEY = os.environ.get("NASDAQ_API_KEY")
 if not API_KEY:
     raise SystemExit("Missing NASDAQ_API_KEY")
 
-# Example: 0.045 means 4.5%
-TREASURY_10Y = float(os.environ.get("TREASURY_10Y", "0.045"))
-
+TREASURY_10Y = float(os.environ.get("TREASURY_10Y", "0.0423"))
 BASE = "https://data.nasdaq.com/api/v3/datatables"
 
 
@@ -29,10 +27,6 @@ def get_json(url: str, params: dict, timeout: int = 180) -> dict:
 
 
 def fetch_datatable_all_rows(code: str, params: dict, timeout: int = 180, max_pages: int = 500) -> pd.DataFrame:
-    """
-    Fetch rows from a Nasdaq Data Link datatable using JSON pagination (cursor_id).
-    Returns a DataFrame with lowercase column names.
-    """
     url = f"{BASE}/{code}.json"
     all_rows = []
     columns = None
@@ -61,29 +55,26 @@ def fetch_datatable_all_rows(code: str, params: dict, timeout: int = 180, max_pa
     return pd.DataFrame(all_rows, columns=[c.lower() for c in columns])
 
 
-def get_latest_sep_date() -> str:
+def get_latest_sep_date_no_sort() -> str:
     """
-    IMPORTANT:
-    Datatables sort syntax: use -date for descending (NOT 'date desc').
+    Your endpoint does NOT allow qopts.sort.
+    So we pull a sample of dates and take max(date) locally.
     """
-    url = f"{BASE}/SHARADAR/SEP.json"
-    params = {
-        "api_key": API_KEY,
-        "qopts.columns": "date",
-        "qopts.sort": "-date",
-        "qopts.per_page": 1,
-    }
-    j = get_json(url, params, timeout=120)
-    cols = [c["name"] for c in j["datatable"]["columns"]]
-    row = j["datatable"]["data"][0]
-    d = dict(zip([c.lower() for c in cols], row))
-    return str(d["date"])
+    df = fetch_datatable_all_rows(
+        "SHARADAR/SEP",
+        params={
+            "qopts.columns": "date",
+            "qopts.per_page": 1000,
+        },
+        timeout=180,
+        max_pages=5,
+    )
+    if df.empty or "date" not in df.columns:
+        raise SystemExit("Could not determine latest SEP date (no dates returned).")
+    return str(df["date"].max())
 
 
 def load_sep_closes(latest_date: str) -> pd.DataFrame:
-    """
-    Pull ALL tickers' close for a specific date.
-    """
     df = fetch_datatable_all_rows(
         "SHARADAR/SEP",
         params={
@@ -95,7 +86,7 @@ def load_sep_closes(latest_date: str) -> pd.DataFrame:
         max_pages=300,
     )
     if df.empty:
-        raise SystemExit("SEP returned 0 rows. Your SEP access may be limited.")
+        raise SystemExit("SEP returned 0 rows for latest_date. Your SEP access may be limited.")
     if "ticker" not in df.columns or "close" not in df.columns:
         raise SystemExit(f"SEP missing expected columns. Got: {list(df.columns)}")
 
@@ -105,28 +96,26 @@ def load_sep_closes(latest_date: str) -> pd.DataFrame:
 
 
 def load_sf1_art_fundamentals() -> pd.DataFrame:
-    """
-    Pull ART fundamentals for:
-    epsusd (for PE), bvps (for PB), dps (for yield), debtnc & equity (LT debt/equity)
-    """
     df = fetch_datatable_all_rows(
         "SHARADAR/SF1",
         params={
             "dimension": "ART",
-            "qopts.columns": "ticker,dimension,calendardate,lastupdated,epsusd,bvps,dps,debtnc,equity",
+            "qopts.columns": "ticker,calendardate,lastupdated,epsusd,bvps,dps,debtnc,equity",
             "qopts.per_page": 10000,
         },
         timeout=180,
         max_pages=500,
     )
+
     needed = {"ticker", "calendardate", "lastupdated", "epsusd", "bvps", "dps", "debtnc", "equity"}
     missing = needed - set(df.columns)
     if missing:
         raise SystemExit(f"SF1 missing required columns: {sorted(missing)}")
 
-    # pick latest ART row per ticker
     df["calendardate"] = pd.to_datetime(df["calendardate"], errors="coerce")
     df["lastupdated"] = pd.to_datetime(df["lastupdated"], errors="coerce")
+
+    # pick latest row per ticker
     df = df.sort_values(["ticker", "calendardate", "lastupdated"])
     df = df.groupby("ticker", as_index=False).tail(1)
 
@@ -137,15 +126,14 @@ def load_sf1_art_fundamentals() -> pd.DataFrame:
 
 
 def main() -> None:
-    latest_price_date = get_latest_sep_date()
+    latest_price_date = get_latest_sep_date_no_sort()
     closes = load_sep_closes(latest_price_date)
 
     sf1 = load_sf1_art_fundamentals()
 
-    # Merge current close with latest fundamentals per ticker
     df = closes.merge(sf1, on="ticker", how="inner")
 
-    # Compute CURRENT ratios using current close
+    # Current ratios computed from current close
     df["pe"] = df["close"] / df["epsusd"]
     df["pb"] = df["close"] / df["bvps"]
     df["div_yield"] = df["dps"] / df["close"]
@@ -154,7 +142,7 @@ def main() -> None:
     for c in ["pe", "pb", "div_yield", "lt_debt_equity"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Apply Wilson's Algorithm (your definition)
+    # Apply your rules
     df["passes"] = (
         df["div_yield"].notna() & (df["div_yield"] >= TREASURY_10Y) &
         df["pe"].notna() & (df["pe"] <= 13) &
@@ -188,6 +176,7 @@ def main() -> None:
         json.dump(out, f, indent=2)
 
     print(f"Wrote passlist.json with {len(pass_list)} PASS tickers (as of {latest_price_date})")
+    print(f"Rows merged: {len(df)} | SEP rows: {len(closes)} | SF1 rows: {len(sf1)}")
 
 
 if __name__ == "__main__":
