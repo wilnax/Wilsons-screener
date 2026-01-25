@@ -3,7 +3,9 @@ name: Weekly Wilson Screener
 on:
   workflow_dispatch:
   schedule:
-    # Thursday 6pm Eastern ≈ 23:00 UTC during standard time, 22:00 UTC during DST
+    # Thursday 6:00pm US/Eastern
+    # Standard Time: 23:00 UTC
+    # Daylight Time: 22:00 UTC
     - cron: "0 22 * * 4"
     - cron: "0 23 * * 4"
 
