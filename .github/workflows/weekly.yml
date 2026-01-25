@@ -35,10 +35,23 @@ jobs:
           TREASURY_10Y: ${{ vars.TREASURY_10Y }}
         run: python run_screener.py
 
+      - name: Archive passlist by runDate
+        run: |
+          mkdir -p runs
+          python - << 'PY'
+          import json, pathlib
+          p = pathlib.Path("passlist.json")
+          j = json.loads(p.read_text())
+          run = j.get("runDate","unknown").replace(":","-")
+          out = pathlib.Path("runs") / f"passlist_{run}.json"
+          out.write_text(json.dumps(j, indent=2))
+          print("Wrote", out)
+          PY
+
       - name: Commit outputs
         run: |
           git config user.name "wilson-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add passlist.json passlist.csv debug_ratios_*.json debug_metrics_*.json
+          git add passlist.json passlist.csv runs/*.json
           git commit -m "Update passlist" || echo "No changes"
           git push
