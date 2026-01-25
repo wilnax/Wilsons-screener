@@ -8,7 +8,9 @@ API_KEY = os.environ.get("NASDAQ_API_KEY")
 if not API_KEY:
     raise SystemExit("Missing NASDAQ_API_KEY")
 
+# Example: 0.045 means 4.5%
 TREASURY_10Y = float(os.environ.get("TREASURY_10Y", "0.045"))
+
 BASE = "https://data.nasdaq.com/api/v3/datatables"
 
 
@@ -27,6 +29,10 @@ def get_json(url: str, params: dict, timeout: int = 180) -> dict:
 
 
 def fetch_datatable_all_rows(code: str, params: dict, timeout: int = 180, max_pages: int = 500) -> pd.DataFrame:
+    """
+    Fetch rows from a Nasdaq Data Link datatable using JSON pagination (cursor_id).
+    Returns a DataFrame with lowercase column names.
+    """
     url = f"{BASE}/{code}.json"
     all_rows = []
     columns = None
@@ -55,134 +61,133 @@ def fetch_datatable_all_rows(code: str, params: dict, timeout: int = 180, max_pa
     return pd.DataFrame(all_rows, columns=[c.lower() for c in columns])
 
 
-def pick_best_row_per_ticker(df: pd.DataFrame, required_cols: list[str]) -> pd.DataFrame:
+def get_latest_sep_date() -> str:
     """
-    Pick one row per ticker:
-    - Prefer rows where all required_cols are non-null
-    - Within that, prefer most recent (lastupdated, calendardate)
+    IMPORTANT:
+    Datatables sort syntax: use -date for descending (NOT 'date desc').
     """
-    df = df.copy()
-    df["calendardate"] = pd.to_datetime(df["calendardate"], errors="coerce")
-    df["lastupdated"] = pd.to_datetime(df["lastupdated"], errors="coerce")
-
-    # Has all required numeric fields?
-    has_all = pd.Series(True, index=df.index)
-    for c in required_cols:
-        has_all &= df[c].notna()
-    df["has_all_required"] = has_all.astype(int)
-
-    # Sort so best rows are last per ticker
-    df = df.sort_values(["ticker", "has_all_required", "lastupdated", "calendardate"])
-
-    # Take best (last) row per ticker
-    best = df.groupby("ticker", as_index=False).tail(1)
-
-    # Ensure ticker is a normal column
-    if "ticker" not in best.columns:
-        best = best.reset_index()
-    return best.reset_index(drop=True)
+    url = f"{BASE}/SHARADAR/SEP.json"
+    params = {
+        "api_key": API_KEY,
+        "qopts.columns": "date",
+        "qopts.sort": "-date",
+        "qopts.per_page": 1,
+    }
+    j = get_json(url, params, timeout=120)
+    cols = [c["name"] for c in j["datatable"]["columns"]]
+    row = j["datatable"]["data"][0]
+    d = dict(zip([c.lower() for c in cols], row))
+    return str(d["date"])
 
 
-def main() -> None:
-    cols = "ticker,dimension,calendardate,lastupdated,price,pe,pb,divyield,debtnc,equity"
-    sf1 = fetch_datatable_all_rows(
+def load_sep_closes(latest_date: str) -> pd.DataFrame:
+    """
+    Pull ALL tickers' close for a specific date.
+    """
+    df = fetch_datatable_all_rows(
+        "SHARADAR/SEP",
+        params={
+            "date": latest_date,
+            "qopts.columns": "ticker,close",
+            "qopts.per_page": 10000,
+        },
+        timeout=180,
+        max_pages=300,
+    )
+    if df.empty:
+        raise SystemExit("SEP returned 0 rows. Your SEP access may be limited.")
+    if "ticker" not in df.columns or "close" not in df.columns:
+        raise SystemExit(f"SEP missing expected columns. Got: {list(df.columns)}")
+
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["ticker", "close"]).drop_duplicates(subset=["ticker"])
+    return df
+
+
+def load_sf1_art_fundamentals() -> pd.DataFrame:
+    """
+    Pull ART fundamentals for:
+    epsusd (for PE), bvps (for PB), dps (for yield), debtnc & equity (LT debt/equity)
+    """
+    df = fetch_datatable_all_rows(
         "SHARADAR/SF1",
         params={
-            "dimension": "ART,MRQ,MRY,TTM",
-            "qopts.columns": cols,
+            "dimension": "ART",
+            "qopts.columns": "ticker,dimension,calendardate,lastupdated,epsusd,bvps,dps,debtnc,equity",
             "qopts.per_page": 10000,
         },
         timeout=180,
         max_pages=500,
     )
-
-    required = {"ticker", "dimension", "calendardate", "lastupdated", "price", "pe", "pb", "divyield", "debtnc", "equity"}
-    missing = required - set(sf1.columns)
+    needed = {"ticker", "calendardate", "lastupdated", "epsusd", "bvps", "dps", "debtnc", "equity"}
+    missing = needed - set(df.columns)
     if missing:
-        raise SystemExit(f"SF1 missing expected columns: {sorted(missing)}")
+        raise SystemExit(f"SF1 missing required columns: {sorted(missing)}")
 
-    # numeric coercion
-    for c in ["price", "pe", "pb", "divyield", "debtnc", "equity"]:
-        sf1[c] = pd.to_numeric(sf1[c], errors="coerce")
+    # pick latest ART row per ticker
+    df["calendardate"] = pd.to_datetime(df["calendardate"], errors="coerce")
+    df["lastupdated"] = pd.to_datetime(df["lastupdated"], errors="coerce")
+    df = df.sort_values(["ticker", "calendardate", "lastupdated"])
+    df = df.groupby("ticker", as_index=False).tail(1)
 
-    # Normalize dividend yield if it looks like percent
-    sf1.loc[sf1["divyield"] > 1, "divyield"] = sf1.loc[sf1["divyield"] > 1, "divyield"] / 100.0
+    for c in ["epsusd", "bvps", "dps", "debtnc", "equity"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    latest = pick_best_row_per_ticker(sf1, required_cols=["price", "pe", "pb", "divyield", "debtnc", "equity"])
+    return df
 
-    # Long-term debt to equity ratio (your screener)
-    latest["lt_debt_equity"] = latest["debtnc"] / latest["equity"]
-    latest["lt_debt_equity"] = pd.to_numeric(latest["lt_debt_equity"], errors="coerce")
 
-    # Rule flags
-    latest["rule_div"] = latest["divyield"].notna() & (latest["divyield"] >= TREASURY_10Y)
-    latest["rule_pe"]  = latest["pe"].notna() & (latest["pe"] <= 13)
-    latest["rule_pb"]  = latest["pb"].notna() & (latest["pb"] <= 1)
-    latest["rule_ltde"] = latest["lt_debt_equity"].notna() & (latest["lt_debt_equity"] <= 1)
-    latest["passes"] = latest["rule_div"] & latest["rule_pe"] & latest["rule_pb"] & latest["rule_ltde"]
+def main() -> None:
+    latest_price_date = get_latest_sep_date()
+    closes = load_sep_closes(latest_price_date)
 
-    winners = latest[latest["passes"]].copy().sort_values("divyield", ascending=False)
+    sf1 = load_sf1_art_fundamentals()
+
+    # Merge current close with latest fundamentals per ticker
+    df = closes.merge(sf1, on="ticker", how="inner")
+
+    # Compute CURRENT ratios using current close
+    df["pe"] = df["close"] / df["epsusd"]
+    df["pb"] = df["close"] / df["bvps"]
+    df["div_yield"] = df["dps"] / df["close"]
+    df["lt_debt_equity"] = df["debtnc"] / df["equity"]
+
+    for c in ["pe", "pb", "div_yield", "lt_debt_equity"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Apply Wilson's Algorithm (your definition)
+    df["passes"] = (
+        df["div_yield"].notna() & (df["div_yield"] >= TREASURY_10Y) &
+        df["pe"].notna() & (df["pe"] <= 13) &
+        df["pb"].notna() & (df["pb"] <= 1) &
+        df["lt_debt_equity"].notna() & (df["lt_debt_equity"] <= 1)
+    )
+
+    winners = df[df["passes"]].copy().sort_values("div_yield", ascending=False)
 
     pass_list = []
     for _, r in winners.iterrows():
-        cd = r["calendardate"]
         pass_list.append({
             "ticker": r["ticker"],
-            "dimension": r["dimension"],
-            "price": None if pd.isna(r["price"]) else round(float(r["price"]), 2),
-            "pe": None if pd.isna(r["pe"]) else round(float(r["pe"]), 4),
-            "pb": None if pd.isna(r["pb"]) else round(float(r["pb"]), 4),
-            "divYield": None if pd.isna(r["divyield"]) else round(float(r["divyield"]), 6),
-            "ltDebtEquity": None if pd.isna(r["lt_debt_equity"]) else round(float(r["lt_debt_equity"]), 4),
-            "priceDate": None if pd.isna(cd) else str(cd.date()),
-        })
-
-    diag = {
-        "rowsPulled": int(len(sf1)),
-        "tickersEvaluated": int(latest["ticker"].nunique()) if "ticker" in latest.columns else int(len(latest)),
-        "maxCalendardate": str(latest["calendardate"].max().date()) if latest["calendardate"].notna().any() else None,
-        "nonnull_price": int(latest["price"].notna().sum()),
-        "nonnull_pe": int(latest["pe"].notna().sum()),
-        "nonnull_pb": int(latest["pb"].notna().sum()),
-        "nonnull_divyield": int(latest["divyield"].notna().sum()),
-        "nonnull_debtnc": int(latest["debtnc"].notna().sum()),
-        "nonnull_equity": int(latest["equity"].notna().sum()),
-        "nonnull_ltde": int(latest["lt_debt_equity"].notna().sum()),
-        "rule_div_pass": int(latest["rule_div"].sum()),
-        "rule_pe_pass": int(latest["rule_pe"].sum()),
-        "rule_pb_pass": int(latest["rule_pb"].sum()),
-        "rule_ltde_pass": int(latest["rule_ltde"].sum()),
-        "all_rules_pass": int(latest["passes"].sum()),
-    }
-
-    sample = latest.sort_values("divyield", ascending=False).head(25)
-    sample_list = []
-    for _, r in sample.iterrows():
-        cd = r["calendardate"]
-        sample_list.append({
-            "ticker": r["ticker"],
-            "dimension": r["dimension"],
-            "price": None if pd.isna(r["price"]) else round(float(r["price"]), 2),
-            "pe": None if pd.isna(r["pe"]) else round(float(r["pe"]), 4),
-            "pb": None if pd.isna(r["pb"]) else round(float(r["pb"]), 4),
-            "divYield": None if pd.isna(r["divyield"]) else round(float(r["divyield"]), 6),
-            "ltDebtEquity": None if pd.isna(r["lt_debt_equity"]) else round(float(r["lt_debt_equity"]), 4),
-            "priceDate": None if pd.isna(cd) else str(cd.date()),
+            "price": round(float(r["close"]), 2),
+            "pe": round(float(r["pe"]), 4) if pd.notna(r["pe"]) else None,
+            "pb": round(float(r["pb"]), 4) if pd.notna(r["pb"]) else None,
+            "divYield": round(float(r["div_yield"]), 6) if pd.notna(r["div_yield"]) else None,
+            "ltDebtEquity": round(float(r["lt_debt_equity"]), 4) if pd.notna(r["lt_debt_equity"]) else None,
+            "priceDate": str(latest_price_date),
         })
 
     out = {
         "runDate": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "asOfPriceDate": str(latest_price_date),
         "treasuryYield10y": TREASURY_10Y,
-        "diagnostics": diag,
+        "passCount": len(pass_list),
         "pass": pass_list,
-        "sampleTop25ByYield": sample_list,
     }
 
     with open("passlist.json", "w") as f:
         json.dump(out, f, indent=2)
 
-    print("Diagnostics:", diag)
-    print(f"Wrote passlist.json with {len(pass_list)} PASS tickers")
+    print(f"Wrote passlist.json with {len(pass_list)} PASS tickers (as of {latest_price_date})")
 
 
 if __name__ == "__main__":
