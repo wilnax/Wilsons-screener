@@ -1,12 +1,13 @@
 {
-  "runDate": "2026-01-25T02:24:55.216015+00:00",
+  "runDate": "2026-01-25T02:35:57.899934+00:00",
   "stats": {
     "treasuryYield10y": 0.0423,
     "universe": 4406,
     "stage1_prefilter": 591,
     "evaluated": 0,
     "skipped_missing": 591,
-    "all_rules_pass": 0
+    "all_rules_pass": 0,
+    "notes": "Debug printed first 3 symbols' ratios/key-metrics keys in Actions logs."
   },
   "pass": [],
   "topCandidates": []
