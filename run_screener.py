@@ -8,9 +8,7 @@ API_KEY = os.environ.get("NASDAQ_API_KEY")
 if not API_KEY:
     raise SystemExit("Missing NASDAQ_API_KEY")
 
-# Set in GitHub Actions Variables: TREASURY_10Y (example: 0.045 = 4.5%)
 TREASURY_10Y = float(os.environ.get("TREASURY_10Y", "0.045"))
-
 BASE = "https://data.nasdaq.com/api/v3/datatables"
 
 
@@ -29,10 +27,6 @@ def get_json(url: str, params: dict, timeout: int = 180) -> dict:
 
 
 def fetch_datatable_all_rows(code: str, params: dict, timeout: int = 180, max_pages: int = 500) -> pd.DataFrame:
-    """
-    Fetch rows from a Nasdaq Data Link datatable using JSON pagination (cursor_id).
-    Returns a DataFrame with lowercase column names.
-    """
     url = f"{BASE}/{code}.json"
     all_rows = []
     columns = None
@@ -52,37 +46,50 @@ def fetch_datatable_all_rows(code: str, params: dict, timeout: int = 180, max_pa
             if not columns:
                 raise SystemExit(f"No columns returned for {code}. Check access/params.")
 
-        data = dt.get("data", [])
-        all_rows.extend(data)
+        all_rows.extend(dt.get("data", []))
 
         cursor = j.get("meta", {}).get("next_cursor_id")
         if not cursor:
             break
 
-    df = pd.DataFrame(all_rows, columns=[c.lower() for c in columns])
-    return df
+    return pd.DataFrame(all_rows, columns=[c.lower() for c in columns])
 
 
-def pick_latest_per_ticker(df: pd.DataFrame) -> pd.DataFrame:
+def pick_latest_row_with_required(df: pd.DataFrame, required_cols: list[str]) -> pd.DataFrame:
     """
-    Pick the latest row per ticker using calendardate then lastupdated.
+    For each ticker, pick the most recent row (lastupdated, calendardate)
+    that has ALL required_cols non-null.
+    If none have all required cols, pick the latest row anyway (so we can diagnose).
     """
     df = df.copy()
     df["calendardate"] = pd.to_datetime(df["calendardate"], errors="coerce")
     df["lastupdated"] = pd.to_datetime(df["lastupdated"], errors="coerce")
-    df = df.sort_values(["ticker", "calendardate", "lastupdated"])
-    return df.groupby("ticker", as_index=False).tail(1)
+
+    # Sort newest last
+    df = df.sort_values(["ticker", "lastupdated", "calendardate"])
+
+    def choose(group: pd.DataFrame) -> pd.DataFrame:
+        g = group.copy()
+        mask = pd.Series(True, index=g.index)
+        for c in required_cols:
+            mask &= g[c].notna()
+        good = g[mask]
+        if len(good) > 0:
+            return good.tail(1)
+        return g.tail(1)
+
+    out = df.groupby("ticker", as_index=False, group_keys=False).apply(choose)
+    return out.reset_index(drop=True)
 
 
 def main() -> None:
-    # Pull SF1 only — your schema provides price/pe/pb/divyield directly.
-    # Use ART dimension for consistency with valuation ratios.
+    # Pull multiple dimensions so we can find where ratios are actually populated.
+    # (Some SF1 fields are populated in certain dimensions depending on plan.)
     cols = "ticker,dimension,calendardate,lastupdated,price,pe,pb,divyield,debtnc,equity"
-
     sf1 = fetch_datatable_all_rows(
         "SHARADAR/SF1",
         params={
-            "dimension": "ART",
+            "dimension": "ART,MRQ,MRY,TTM",   # broaden; if one isn't supported it will just return what exists
             "qopts.columns": cols,
             "qopts.per_page": 10000,
         },
@@ -90,29 +97,29 @@ def main() -> None:
         max_pages=500,
     )
 
-    required = {"ticker", "calendardate", "price", "pe", "pb", "divyield", "debtnc", "equity"}
-    missing = required - set(sf1.columns)
+    required = ["ticker", "dimension", "calendardate", "lastupdated", "price", "pe", "pb", "divyield", "debtnc", "equity"]
+    missing = set(required) - set(sf1.columns)
     if missing:
-        raise SystemExit(f"SF1 missing required columns: {sorted(missing)}")
+        raise SystemExit(f"SF1 missing expected columns: {sorted(missing)}")
 
-    latest = pick_latest_per_ticker(sf1)
+    # numeric coercion
+    for c in ["price", "pe", "pb", "divyield", "debtnc", "equity"]:
+        sf1[c] = pd.to_numeric(sf1[c], errors="coerce")
 
-    # Coerce to numeric
-    for col in ["price", "pe", "pb", "divyield", "debtnc", "equity"]:
-        latest[col] = pd.to_numeric(latest[col], errors="coerce")
+    # Normalize dividend yield if it appears to be in percent
+    sf1.loc[sf1["divyield"] > 1, "divyield"] = sf1.loc[sf1["divyield"] > 1, "divyield"] / 100.0
 
-    # Normalize dividend yield:
-    # Some feeds store yield as percent (e.g., 6.2) instead of fraction (0.062).
-    latest.loc[latest["divyield"] > 1, "divyield"] = latest.loc[latest["divyield"] > 1, "divyield"] / 100.0
+    # Pick the latest row per ticker that actually has the needed fields
+    latest = pick_latest_row_with_required(sf1, required_cols=["price", "pe", "pb", "divyield", "debtnc", "equity"])
 
     # Long-term debt to equity ratio (your screener setting)
     latest["lt_debt_equity"] = latest["debtnc"] / latest["equity"]
     latest["lt_debt_equity"] = pd.to_numeric(latest["lt_debt_equity"], errors="coerce")
 
-    # Rule flags (useful for debugging / confidence)
+    # Rule flags
     latest["rule_div"] = latest["divyield"].notna() & (latest["divyield"] >= TREASURY_10Y)
-    latest["rule_pe"] = latest["pe"].notna() & (latest["pe"] <= 13)
-    latest["rule_pb"] = latest["pb"].notna() & (latest["pb"] <= 1)
+    latest["rule_pe"]  = latest["pe"].notna() & (latest["pe"] <= 13)
+    latest["rule_pb"]  = latest["pb"].notna() & (latest["pb"] <= 1)
     latest["rule_ltde"] = latest["lt_debt_equity"].notna() & (latest["lt_debt_equity"] <= 1)
 
     latest["passes"] = latest["rule_div"] & latest["rule_pe"] & latest["rule_pb"] & latest["rule_ltde"]
@@ -122,21 +129,28 @@ def main() -> None:
     pass_list = []
     for _, r in winners.iterrows():
         cd = r["calendardate"]
-        pass_list.append(
-            {
-                "ticker": r["ticker"],
-                "price": round(float(r["price"]), 2) if pd.notna(r["price"]) else None,
-                "pe": round(float(r["pe"]), 4) if pd.notna(r["pe"]) else None,
-                "pb": round(float(r["pb"]), 4) if pd.notna(r["pb"]) else None,
-                "divYield": round(float(r["divyield"]), 6) if pd.notna(r["divyield"]) else None,
-                "ltDebtEquity": round(float(r["lt_debt_equity"]), 4) if pd.notna(r["lt_debt_equity"]) else None,
-                "priceDate": str(cd.date()) if pd.notna(cd) else None,
-            }
-        )
+        pass_list.append({
+            "ticker": r["ticker"],
+            "dimension": r["dimension"],
+            "price": round(float(r["price"]), 2) if pd.notna(r["price"]) else None,
+            "pe": round(float(r["pe"]), 4) if pd.notna(r["pe"]) else None,
+            "pb": round(float(r["pb"]), 4) if pd.notna(r["pb"]) else None,
+            "divYield": round(float(r["divyield"]), 6) if pd.notna(r["divyield"]) else None,
+            "ltDebtEquity": round(float(r["lt_debt_equity"]), 4) if pd.notna(r["lt_debt_equity"]) else None,
+            "priceDate": str(cd.date()) if pd.notna(cd) else None,
+        })
 
-    stats = {
-        "totalTickersEvaluated": int(len(latest)),
-        "asOfCalendardateMax": str(latest["calendardate"].max().date()) if latest["calendardate"].notna().any() else None,
+    # Diagnostics: how many non-null values do we even have?
+    diag = {
+        "tickersEvaluated": int(len(latest)),
+        "maxCalendardate": str(latest["calendardate"].max().date()) if latest["calendardate"].notna().any() else None,
+        "nonnull_price": int(latest["price"].notna().sum()),
+        "nonnull_pe": int(latest["pe"].notna().sum()),
+        "nonnull_pb": int(latest["pb"].notna().sum()),
+        "nonnull_divyield": int(latest["divyield"].notna().sum()),
+        "nonnull_debtnc": int(latest["debtnc"].notna().sum()),
+        "nonnull_equity": int(latest["equity"].notna().sum()),
+        "nonnull_ltde": int(latest["lt_debt_equity"].notna().sum()),
         "rule_div_pass": int(latest["rule_div"].sum()),
         "rule_pe_pass": int(latest["rule_pe"].sum()),
         "rule_pb_pass": int(latest["rule_pb"].sum()),
@@ -144,19 +158,35 @@ def main() -> None:
         "all_rules_pass": int(latest["passes"].sum()),
     }
 
+    # Also include a small sample so you can SEE actual values without digging
+    sample = latest.sort_values("divyield", ascending=False).head(25)
+    sample_list = []
+    for _, r in sample.iterrows():
+        cd = r["calendardate"]
+        sample_list.append({
+            "ticker": r["ticker"],
+            "dimension": r["dimension"],
+            "price": None if pd.isna(r["price"]) else round(float(r["price"]), 2),
+            "pe": None if pd.isna(r["pe"]) else round(float(r["pe"]), 4),
+            "pb": None if pd.isna(r["pb"]) else round(float(r["pb"]), 4),
+            "divYield": None if pd.isna(r["divyield"]) else round(float(r["divyield"]), 6),
+            "ltDebtEquity": None if pd.isna(r["lt_debt_equity"]) else round(float(r["lt_debt_equity"]), 4),
+            "priceDate": None if pd.isna(cd) else str(cd.date()),
+        })
+
     out = {
         "runDate": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "treasuryYield10y": TREASURY_10Y,
-        "dimension": "ART",
-        "stats": stats,
+        "diagnostics": diag,
         "pass": pass_list,
+        "sampleTop25ByYield": sample_list,
     }
 
     with open("passlist.json", "w") as f:
         json.dump(out, f, indent=2)
 
+    print("Diagnostics:", diag)
     print(f"Wrote passlist.json with {len(pass_list)} PASS tickers")
-    print("Stats:", stats)
 
 
 if __name__ == "__main__":
