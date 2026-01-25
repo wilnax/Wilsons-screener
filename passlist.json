@@ -1,7 +1,17 @@
 {
-  "runDate": "2026-01-25T01:03:43.820368+00:00",
-  "asOfPriceDate": "2018-12-31",
-  "treasuryYield10y": 0.0423,
-  "passCount": 0,
-  "pass": []
+  "runDate": "2026-01-25T01:13:05.100922+00:00",
+  "stats": {
+    "asOfPriceDate": "2018-12-31",
+    "treasuryYield10y": 0.0423,
+    "sepRows": 30,
+    "sf1Rows": 0,
+    "mergedRows": 0,
+    "div_rule_pass": 0,
+    "pe_rule_pass": 0,
+    "pb_rule_pass": 0,
+    "ltde_rule_pass": 0,
+    "all_rules_pass": 0
+  },
+  "pass": [],
+  "topCandidates": []
 }
