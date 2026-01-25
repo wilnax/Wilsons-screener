@@ -1,15 +1,11 @@
 {
-  "runDate": "2026-01-25T01:13:05.100922+00:00",
+  "runDate": "2026-01-25T02:24:55.216015+00:00",
   "stats": {
-    "asOfPriceDate": "2018-12-31",
     "treasuryYield10y": 0.0423,
-    "sepRows": 30,
-    "sf1Rows": 0,
-    "mergedRows": 0,
-    "div_rule_pass": 0,
-    "pe_rule_pass": 0,
-    "pb_rule_pass": 0,
-    "ltde_rule_pass": 0,
+    "universe": 4406,
+    "stage1_prefilter": 591,
+    "evaluated": 0,
+    "skipped_missing": 591,
     "all_rules_pass": 0
   },
   "pass": [],
