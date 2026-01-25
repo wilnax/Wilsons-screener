@@ -18,8 +18,8 @@ KEY_METRICS_TTM_URL = "https://financialmodelingprep.com/stable/key-metrics-ttm"
 ALLOWED_EXCHANGES = {"NYSE", "NASDAQ", "AMEX"}
 
 SLEEP_BETWEEN_CALLS_SEC = 0.12
-MAX_TICKERS_TO_EVALUATE = 1200  # keep manageable; raise later if needed
-DEBUG_FIRST_N = 3               # print first 3 endpoint shapes
+MAX_TICKERS_TO_EVALUATE = 1200  # raise later after this works
+DEBUG_SAVE_FIRST_N = 3          # saves first 3 raw payloads to json files
 
 
 def _get_json(url: str, params: dict, timeout: int = 180):
@@ -29,20 +29,6 @@ def _get_json(url: str, params: dict, timeout: int = 180):
         print(f"HTTP {r.status_code} error for {url}\nResponse snippet:\n{snippet}\n")
         r.raise_for_status()
     return r.json()
-
-
-def _first_record(obj):
-    """
-    Normalize FMP stable responses to a single dict record:
-      - if obj is dict -> return it
-      - if obj is list of dicts -> return first dict
-      - else -> None
-    """
-    if isinstance(obj, dict):
-        return obj
-    if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], dict):
-        return obj[0]
-    return None
 
 
 def _to_float(x):
@@ -71,6 +57,46 @@ def _pick(d: dict, keys):
     return None
 
 
+def _extract_first_record(payload):
+    """
+    Stable endpoints may return:
+      - dict of fields (record)
+      - list of dicts (records)
+      - dict wrapper that contains list under keys like data/result/metrics/ratios/items
+    We normalize to a single dict record or None.
+    """
+    if payload is None:
+        return None
+
+    # Case 1: list of dicts
+    if isinstance(payload, list):
+        if len(payload) > 0 and isinstance(payload[0], dict):
+            return payload[0]
+        return None
+
+    # Case 2: dict record or dict wrapper
+    if isinstance(payload, dict):
+        # If it's already a record (has typical fields), return it as-is
+        # Otherwise, try common wrapper keys that hold a list of dicts
+        wrapper_keys = ["data", "result", "results", "items", "metrics", "ratios"]
+        for k in wrapper_keys:
+            if k in payload and isinstance(payload[k], list) and len(payload[k]) > 0 and isinstance(payload[k][0], dict):
+                return payload[k][0]
+
+        # Sometimes wrapper contains nested dict with list inside
+        for k in wrapper_keys:
+            if k in payload and isinstance(payload[k], dict):
+                inner = payload[k]
+                for kk in wrapper_keys:
+                    if kk in inner and isinstance(inner[kk], list) and len(inner[kk]) > 0 and isinstance(inner[kk][0], dict):
+                        return inner[kk][0]
+
+        # If it’s a dict but not a wrapper we recognize, treat it as record
+        return payload
+
+    return None
+
+
 def fetch_us_universe() -> pd.DataFrame:
     params = {
         "apikey": FMP_API_KEY,
@@ -87,15 +113,15 @@ def fetch_us_universe() -> pd.DataFrame:
 
 
 def fetch_ratios_ttm(symbol: str):
-    data = _get_json(RATIOS_TTM_URL, {"apikey": FMP_API_KEY, "symbol": symbol}, timeout=180)
+    payload = _get_json(RATIOS_TTM_URL, {"apikey": FMP_API_KEY, "symbol": symbol}, timeout=180)
     time.sleep(SLEEP_BETWEEN_CALLS_SEC)
-    return _first_record(data)
+    return payload
 
 
 def fetch_key_metrics_ttm(symbol: str):
-    data = _get_json(KEY_METRICS_TTM_URL, {"apikey": FMP_API_KEY, "symbol": symbol}, timeout=180)
+    payload = _get_json(KEY_METRICS_TTM_URL, {"apikey": FMP_API_KEY, "symbol": symbol}, timeout=180)
     time.sleep(SLEEP_BETWEEN_CALLS_SEC)
-    return _first_record(data)
+    return payload
 
 
 def main() -> None:
@@ -133,22 +159,26 @@ def main() -> None:
     results = []
     skipped_missing = 0
 
-    debug_printed = 0
+    debug_saved = 0
 
     for _, r in stage1.iterrows():
         sym = r["ticker"]
         px = float(r["price"])
         exch = r["exchange"]
 
-        ratios = fetch_ratios_ttm(sym)
-        metrics = fetch_key_metrics_ttm(sym)
+        ratios_payload = fetch_ratios_ttm(sym)
+        metrics_payload = fetch_key_metrics_ttm(sym)
 
-        # DEBUG: print the first few shapes/keys we receive
-        if debug_printed < DEBUG_FIRST_N:
-            print(f"\nDEBUG symbol={sym}")
-            print("  ratios type:", type(ratios).__name__, "keys:", sorted(list(ratios.keys()))[:25] if isinstance(ratios, dict) else None)
-            print("  metrics type:", type(metrics).__name__, "keys:", sorted(list(metrics.keys()))[:25] if isinstance(metrics, dict) else None)
-            debug_printed += 1
+        # Save first few raw payloads to files so you can open them in the repo
+        if debug_saved < DEBUG_SAVE_FIRST_N:
+            with open(f"debug_ratios_{debug_saved+1}.json", "w") as f:
+                json.dump({"symbol": sym, "payload": ratios_payload}, f, indent=2)
+            with open(f"debug_metrics_{debug_saved+1}.json", "w") as f:
+                json.dump({"symbol": sym, "payload": metrics_payload}, f, indent=2)
+            debug_saved += 1
+
+        ratios = _extract_first_record(ratios_payload)
+        metrics = _extract_first_record(metrics_payload)
 
         pe = pb = debt_equity = div_yield = None
 
@@ -168,7 +198,7 @@ def main() -> None:
             if div_yield is None:
                 div_yield = _normalize_div_yield(_pick(metrics, ["dividendYieldTTM", "dividendYield"]))
 
-        # Final dividend yield fallback: estimate from lastAnnualDividend/price
+        # Dividend yield fallback: lastAnnualDividend / price
         if div_yield is None:
             div_yield = _normalize_div_yield(r["divYield_est"])
 
@@ -219,7 +249,8 @@ def main() -> None:
         "evaluated": int(len(out)),
         "skipped_missing": int(skipped_missing),
         "all_rules_pass": int(len(pass_df)),
-        "notes": "Debug printed first 3 symbols' ratios/key-metrics keys in Actions logs."
+        "debug_files_written": int(debug_saved),
+        "notes": "Open debug_ratios_*.json and debug_metrics_*.json in the repo to see the exact stable response shape."
     }
 
     payload = {
@@ -234,7 +265,7 @@ def main() -> None:
 
     pass_df.to_csv("passlist.csv", index=False)
 
-    print("\nStats:", stats)
+    print("Stats:", stats)
     print(f"Wrote passlist.json and passlist.csv with {len(pass_df)} PASS tickers")
 
 
