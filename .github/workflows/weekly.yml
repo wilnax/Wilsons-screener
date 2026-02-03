@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
   schedule:
     # Thursday 6:00pm US/Eastern
-    # Standard Time: 23:00 UTC
-    # Daylight Time: 22:00 UTC
-    - cron: "0 22 * * 4"
-    - cron: "0 23 * * 4"
+    # We trigger twice in UTC and gate by ET inside the job
+    - cron: "17 22 * * 4"
+    - cron: "17 23 * * 4"
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   run:
@@ -20,6 +20,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+
+      # ---- DST / timezone guard ----
+      - name: Only run at 6pm Eastern
+        run: |
+          HOUR=$(TZ=America/New_York date +%H)
+          DOW=$(TZ=America/New_York date +%u)  # 4 = Thursday
+          echo "ET day=$DOW hour=$HOUR"
+          if [ "$DOW" != "4" ] || [ "$HOUR" != "18" ]; then
+            echo "Not 6pm ET Thursday, exiting."
+            exit 0
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
