@@ -1,6 +1,6 @@
 ticker,price,divYield,pe,pb,debtEquity,rule_div,rule_pe,rule_pb,rule_de,passes
 PDCC,9.6,0.26558,5.6815,0.6675,0.0703,True,True,True,True,True
-PDPA,25.21,0.26558,5.6815,0.6675,0.0703,True,True,True,True,True
+PDPA,25.22,0.26558,5.6815,0.6675,0.0703,True,True,True,True,True
 STRS,20.67,0.2419,7.7352,0.7773,0.7545,True,True,True,True,True
 REFI,10.85,0.17327,7.4315,0.7538,0.3838,True,True,True,True,True
 FSCO,4.83,0.16058,6.3553,0.6618,0.1982,True,True,True,True,True
