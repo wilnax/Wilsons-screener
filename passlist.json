@@ -1,10 +1,10 @@
 {
-  "runDate": "2026-11-13T02:38:04.583952+00:00",
+  "runDate": "2026-11-13T03:25:32.761048+00:00",
   "stats": {
     "treasuryYield10y": 0.0423,
     "universe": 4234,
-    "stage1_prefilter": 401,
-    "evaluated": 263,
+    "stage1_prefilter": 402,
+    "evaluated": 264,
     "skipped": 138,
     "all_rules_pass": 34
   },
